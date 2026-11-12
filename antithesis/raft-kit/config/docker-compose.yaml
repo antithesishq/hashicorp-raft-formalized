@@ -1,0 +1,73 @@
+# Only raft1 builds the image; raft2 and raft3 run the same one.
+x-raft: &raft
+  platform: linux/amd64
+  image: raft-kit:latest
+
+x-raft-env: &raft-env
+  PEERS: raft1=raft1:7000,raft2=raft2:7000,raft3=raft3:7000
+  LOG_FORWARD_SOCKET: /logs/driver.sock
+  # The server's own lines, and raft's messages for fault-only paths
+  # (driver/src/logs.rs, RARE_PATHS). Comma-separated substrings.
+  LOG_FORWARD_MATCH: "msg=raft-,Election timeout reached,failed to contact quorum of nodes,previous log term mis-match,rejecting vote request since our last,peer has newer term"
+  # Raft's steps at its interfaces are reported here, synchronously
+  # (tracekit.Sink, server/wrap.go).
+  TRACEKIT_SOCKET: /logs/kit.sock
+
+services:
+  raft1:
+    <<: *raft
+    build:
+      context: ../../..
+      dockerfile: antithesis/raft-kit/server/Dockerfile
+    container_name: raft1
+    hostname: raft1
+    environment:
+      <<: *raft-env
+      NODE_ID: raft1
+    volumes: [logs:/logs, raft1-data:/data]
+
+  raft2:
+    <<: *raft
+    container_name: raft2
+    hostname: raft2
+    environment:
+      <<: *raft-env
+      NODE_ID: raft2
+    volumes: [logs:/logs, raft2-data:/data]
+
+  raft3:
+    <<: *raft
+    container_name: raft3
+    hostname: raft3
+    environment:
+      <<: *raft-env
+      NODE_ID: raft3
+    volumes: [logs:/logs, raft3-data:/data]
+
+  driver:
+    container_name: driver
+    hostname: driver
+    platform: linux/amd64
+    build:
+      context: ../../..
+      dockerfile: antithesis/raft-kit/driver/Dockerfile
+    image: raft-kit-driver:latest
+    environment:
+      NODE_URLS: http://raft1:8000,http://raft2:8000,http://raft3:8000
+      TRACEKIT_SOCKET: /logs/kit.sock
+      TRACEKIT_DIR: /trace-kit
+      # Print the event stream too, so a timeline's stream can be recovered
+      # and checked again offline. scripts/launch.sh suppresses these lines
+      # during fuzzing (retroactive logging).
+      DRIVER_PRINT_TRACE: "1"
+    # The kernel queues only 10 datagrams per Unix socket by default.
+    sysctls:
+      net.unix.max_dgram_qlen: "4096"
+    volumes: [logs:/logs, trace-kit:/trace-kit]
+
+volumes:
+  logs:
+  trace-kit:
+  raft1-data:
+  raft2-data:
+  raft3-data:

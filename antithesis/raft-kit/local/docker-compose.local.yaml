@@ -1,0 +1,12 @@
+# Local loop only: SDK output to a file. By default there is no eventually:
+# the run is stopped from outside and its trace checked afterwards. With
+# DRIVER_EVENTUALLY=on DRIVER_EVENTUALLY_AFTER=30 the driver checks the trace
+# itself, as it does in Antithesis.
+services:
+  driver:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+      DRIVER_EVENTUALLY: ${DRIVER_EVENTUALLY:-off}
+      DRIVER_EVENTUALLY_AFTER: ${DRIVER_EVENTUALLY_AFTER:-}
+      DRIVER_ADD_RATE: ${DRIVER_ADD_RATE:-5}
+      DRIVER_LINEAR_RATE: ${DRIVER_LINEAR_RATE:-2}
