@@ -1,0 +1,9 @@
+{
+  "stream_spec": "RaftBinding.tla",
+  "stream_config": "RaftBinding.cfg",
+  "tools": "../tools",
+  "classes": "../../tracekit/stream/classes",
+  "library": [
+    "../../tracekit/tla"
+  ]
+}

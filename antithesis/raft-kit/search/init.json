@@ -1,0 +1,8 @@
+{"k": 0, "dead": null,
+ "nodes": {
+  "raft1": {"term": 1, "vt": 0, "vf": "", "log": [{"term": 1, "type": "config", "value": ""}], "role": "follower", "commit": 0, "conf": {"term": 0, "index": 0}, "ready": false, "undo": null, "pending": null, "verified": 0, "srvLen": 0},
+  "raft2": {"term": 1, "vt": 0, "vf": "", "log": [{"term": 1, "type": "config", "value": ""}], "role": "follower", "commit": 0, "conf": {"term": 0, "index": 0}, "ready": false, "undo": null, "pending": null, "verified": 0, "srvLen": 0},
+  "raft3": {"term": 1, "vt": 0, "vf": "", "log": [{"term": 1, "type": "config", "value": ""}], "role": "follower", "commit": 0, "conf": {"term": 0, "index": 0}, "ready": false, "undo": null, "pending": null, "verified": 0, "srvLen": 0}},
+ "appends": {"raft1": {}, "raft2": {}, "raft3": {}},
+ "voteReqs": {}, "grants": {}, "acks": {}, "votes": {}, "leaderOf": {}, "leaderSet": {}, "ledLog": {},
+ "chain": [], "termLen": {}}
