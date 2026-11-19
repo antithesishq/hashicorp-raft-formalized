@@ -1,3 +1,7 @@
+> [!TIP]
+> This document is the README for the top-level hashicorp-raft repository. For the formalization
+> produced by Antithesis, see [`antithesis-fm/README.md`](antithesis-fm/README.md).
+
 raft [![Build Status](https://github.com/hashicorp/raft/workflows/ci/badge.svg)](https://github.com/hashicorp/raft/actions)
 [![Go Reference](https://pkg.go.dev/badge/github.com/hashicorp/raft.svg)](https://pkg.go.dev/github.com/hashicorp/raft)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hashicorp/raft)](https://goreportcard.com/report/github.com/hashicorp/raft)

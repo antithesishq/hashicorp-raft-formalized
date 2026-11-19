@@ -1,0 +1,34 @@
+diff --git a/replication.go b/replication.go
+index 02d4050..538c07e 100644
+--- a/replication.go
++++ b/replication.go
+@@ -226,6 +226,16 @@ START:
+ 		return
+ 	}
+ 
++	// A replicator can outlive its leadership (it may be asleep in the
++	// backoff above when it is told to stop), and the log it has just read
++	// may then have been rewritten by a later leader. If the node is still
++	// the leader in this replicator's term, the request was built from that
++	// leader's log: a node leads a term at most once, and only it writes
++	// its log while it does.
++	if r.getState() != Leader || r.getCurrentTerm() != s.currentTerm {
++		return true
++	}
++
+ 	// Make the RPC call
+ 	start = time.Now()
+ 	if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
+@@ -516,6 +526,12 @@ func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *u
+ 		return true
+ 	}
+ 
++	// As in replicateTo: the request is sent only if the node still leads
++	// this replicator's term, having read its log and commit index.
++	if r.getState() != Leader || r.getCurrentTerm() != s.currentTerm {
++		return true
++	}
++
+ 	// Pipeline the append entries
+ 	if _, err := p.AppendEntries(req, new(AppendEntriesResponse)); err != nil {
+ 		r.logger.Error("failed to pipeline appendEntries", "peer", s.peer, "error", err)

@@ -1,0 +1,21 @@
+diff --git a/raft.go b/raft.go
+index 95c4e31..369d4c3 100644
+--- a/raft.go
++++ b/raft.go
+@@ -1624,10 +1624,13 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+ 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "storeLogs"}, start)
+ 	}
+ 
+-	// Update the commit index
+-	if a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {
++	// Update the commit index. Only the entries this request covers (up to
++	// PrevLogEntry plus its entries) are known to match the leader's log, so
++	// the commit index is capped there, not at the node's own last index: a
++	// tail beyond it may be left from an earlier term and never have been
++	// committed. The commit index never moves backwards.
++	if idx := min(a.LeaderCommitIndex, a.PrevLogEntry+uint64(len(a.Entries))); idx > r.getCommitIndex() {
+ 		start := time.Now()
+-		idx := min(a.LeaderCommitIndex, r.getLastIndex())
+ 		r.setCommitIndex(idx)
+ 		if r.configurations.latestIndex <= idx {
+ 			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)

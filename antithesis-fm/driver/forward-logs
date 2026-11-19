@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Runs "$@" with stderr piped through log-forward, forwards signals, exits with its status.
+set -m
+fifo=$(mktemp -u /tmp/forward-logs.XXXXXX)
+mkfifo "$fifo"
+log-forward <"$fifo" >&2 &
+fwd=$!
+"$@" 2>"$fifo" &
+child=$!
+for sig in TERM INT QUIT HUP USR1 USR2; do
+  trap "kill -$sig $child 2>/dev/null" "$sig"
+done
+while true; do
+  wait "$child"
+  status=$?
+  # wait returns early on a trapped signal; loop until the child exits.
+  if ! kill -0 "$child" 2>/dev/null; then
+    break
+  fi
+done
+for _ in $(seq 50); do
+  kill -0 "$fwd" 2>/dev/null || break
+  sleep 0.1
+done
+kill "$fwd" 2>/dev/null
+rm -f "$fifo"
+exit "$status"
