@@ -1,0 +1,84 @@
+# Three raft nodes (raft with ../patches, RAFT_PATCHES) and the driver, which
+# checks their steps against spec/HashicorpRaft.tla. Variables are set by
+# scripts/build-env.sh. Only raft1 builds the image. The "hashicorp-" container
+# prefix lets this cluster share a Docker host with etcd-raft's.
+x-raft: &raft
+  platform: linux/amd64
+  image: hashicorp-raft:latest
+
+x-raft-env: &raft-env
+  # The voters (NODES=5: scripts/build-env.sh, scripts/compose-nodes.py).
+  PEERS: ${PEERS:-raft1=raft1:7000,raft2=raft2:7000,raft3=raft3:7000}
+  LOG_FORWARD_SOCKET: /logs/driver.sock
+  # Log lines forwarded to the driver (driver/src/logs.rs, RARE_PATHS).
+  LOG_FORWARD_MATCH: "msg=raft-,Election timeout reached,failed to contact quorum of nodes,previous log term mis-match,rejecting vote request since,peer has newer term,rejecting pre-vote request since,pre-vote campaign failed"
+  PREVOTE_DISABLED: ${PREVOTE_DISABLED:-0}
+  # raft's snapshot settings; the defaults never snapshot.
+  SNAPSHOT_INTERVAL: ${SNAPSHOT_INTERVAL:-1000h}
+  SNAPSHOT_THRESHOLD: ${SNAPSHOT_THRESHOLD:-1099511627776}
+  TRAILING_LOGS: ${TRAILING_LOGS:-1099511627776}
+  # Steps are reported here synchronously (tracekit.Sink, server/wrap.go).
+  TRACEKIT_SOCKET: /logs/kit.sock
+
+services:
+  raft1:
+    <<: *raft
+    build:
+      context: ../..
+      dockerfile: antithesis-fm/server/Dockerfile
+      args:
+        RAFT_PATCHES: ${RAFT_PATCHES-R1 R2 R3 R4}
+    container_name: hashicorp-raft1
+    hostname: raft1
+    environment:
+      <<: *raft-env
+      NODE_ID: raft1
+    volumes: [logs:/logs, raft1-data:/data]
+
+  raft2:
+    <<: *raft
+    container_name: hashicorp-raft2
+    hostname: raft2
+    environment:
+      <<: *raft-env
+      NODE_ID: raft2
+    volumes: [logs:/logs, raft2-data:/data]
+
+  raft3:
+    <<: *raft
+    container_name: hashicorp-raft3
+    hostname: raft3
+    environment:
+      <<: *raft-env
+      NODE_ID: raft3
+    volumes: [logs:/logs, raft3-data:/data]
+
+  driver:
+    container_name: hashicorp-driver
+    hostname: driver
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: antithesis-fm/driver/Dockerfile
+    image: hashicorp-raft-driver:latest
+    environment:
+      NODE_URLS: ${NODE_URLS:-http://raft1:8000,http://raft2:8000,http://raft3:8000}
+      TRACEKIT_SOCKET: /logs/kit.sock
+      TRACEKIT_DIR: /trace-kit
+      PREVOTE: ${PREVOTE:-1}
+      # With snapshots the driver also requests some and expects snapshot steps.
+      SNAPSHOTS: ${SNAPSHOTS:-0}
+      TRACEKIT_STREAM_CONFIG: ${STREAM_CONFIG:-RaftBinding.cfg}
+      # Print the event stream for offline re-checking (filtered by scripts/launch.sh).
+      DRIVER_PRINT_TRACE: "1"
+    # The kernel queues only 10 datagrams per Unix socket by default.
+    sysctls:
+      net.unix.max_dgram_qlen: "4096"
+    volumes: [logs:/logs, trace-kit:/trace-kit]
+
+volumes:
+  logs:
+  trace-kit:
+  raft1-data:
+  raft2-data:
+  raft3-data:

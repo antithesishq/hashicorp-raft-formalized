@@ -1,0 +1,581 @@
+---- MODULE HashicorpRaft ----
+\* hashicorp/raft with the patches R1-R4 of ../patches applied, at the
+\* granularity of its observable steps: one stable-storage write, one message
+\* sent, one reply, one role change. A handler is a sequence of such actions,
+\* so a crash between two writes is just a prefix.
+\* `msgs` only grows: every message is a fact that may be acted on any number
+\* of times, later, which covers delay, loss, duplication and retries.
+\* Scope: three or more fixed voters, no membership change. Snapshots
+\* (constant Snapshots), pre-vote (PreVote) and leadership transfer are
+\* modelled; the latter two only as far as they gate starting an election.
+\* Deliberate difference from the code: a follower commits only within the
+\* prefix the leader has confirmed (`confirmed`), not up to the end of its log.
+\* Requests carry entries from the sender's log as leader of their term
+\* (`ledLog`), which patch R1 makes the code do. See spec/README.md.
+EXTENDS Naturals, FiniteSets, Sequences
+
+CONSTANTS Server,   \* the voters
+          Values,   \* client command payloads
+          Nil,      \* "no server" / "no value"
+          PreVote,  \* TRUE: a candidate asks for pre-votes before an election
+          Snapshots \* TRUE: nodes take, send and install snapshots
+
+ASSUME Nil \notin Server
+ASSUME PreVote \in BOOLEAN
+ASSUME Snapshots \in BOOLEAN
+\* Named so that proofs can cite it.
+ASSUME ServerFinite == IsFiniteSet(Server)
+
+Follower  == "follower"
+Candidate == "candidate"
+Leader    == "leader"
+
+VARIABLES
+    \* Durable, per node.
+    currentTerm, voteTerm, voteFor, log,
+    \* Durable, per node. snap[i]: entries covered by i's newest snapshot.
+    \* base[i]: entries deleted from the front of i's log store (log[i]
+    \* stays the whole log).
+    snap, base,
+    \* Volatile, per node. lastApplied[i]: entries handed to the FSM since start.
+    role, commitIndex, lastApplied,
+    \* Volatile: i received TimeoutNow and has not started an election since.
+    transfer,
+    \* confirmed[i] = [term, index]: log[i] agrees with the leader of `term`
+    \* up to `index`.
+    confirmed,
+    \* Facts: messages sent; every (voter, term, cand) vote record held;
+    \* every (server, term) elected.
+    msgs, votes, leaders,
+    \* ledLog[t]: the log of the leader of t when it last led t. Sending reads
+    \* this, not the sender's current state, since a request may be sent late.
+    ledLog,
+    \* History: committed prefixes, with the leader term they come from.
+    commits,
+    \* History: every (server, index, entry) handed to a state machine.
+    applied
+
+durable  == <<currentTerm, voteTerm, voteFor, log, snap, base>>
+protoVars == <<currentTerm, voteTerm, voteFor, log, snap, base, role, commitIndex, lastApplied,
+               transfer, confirmed, msgs, votes, leaders, ledLog>>
+vars == <<protoVars, commits, applied>>
+
+Min(a, b) == IF a <= b THEN a ELSE b
+Max(a, b) == IF a >= b THEN a ELSE b
+IsQuorum(S) == Cardinality(S) * 2 > Cardinality(Server)
+IsPrefix(a, b) == Len(a) <= Len(b) /\ a = SubSeq(b, 1, Len(a))
+TermAt(l, k) == IF k > 0 /\ k <= Len(l) THEN l[k].term ELSE 0
+LastTerm(i) == TermAt(log[i], Len(log[i]))
+Entry(t, ty, v) == [term |-> t, type |-> ty, value |-> v]
+
+Init ==
+    /\ currentTerm = [s \in Server |-> 1]
+    /\ voteTerm    = [s \in Server |-> 0]
+    /\ voteFor     = [s \in Server |-> Nil]
+    \* Bootstrap writes the configuration entry at index 1, term 1.
+    /\ log         = [s \in Server |-> <<Entry(1, "config", Nil)>>]
+    /\ snap        = [s \in Server |-> <<>>]
+    /\ base        = [s \in Server |-> 0]
+    /\ role        = [s \in Server |-> Follower]
+    /\ commitIndex = [s \in Server |-> 0]
+    /\ lastApplied = [s \in Server |-> 0]
+    /\ transfer    = [s \in Server |-> FALSE]
+    /\ confirmed   = [s \in Server |-> [term |-> 0, index |-> 0]]
+    /\ msgs        = {}
+    /\ votes       = {}
+    /\ leaders     = {}
+    /\ ledLog      = <<>>
+    /\ commits     = {}
+    /\ applied     = {}
+
+----
+\* Roles. The code changes role and term in separate steps.
+
+BecomeCandidate(i) ==
+    /\ role' = [role EXCEPT ![i] = Candidate]
+    /\ UNCHANGED <<transfer, durable, commitIndex, lastApplied, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+BecomeFollower(i) ==
+    /\ role' = [role EXCEPT ![i] = Follower]
+    /\ transfer' = [transfer EXCEPT ![i] = FALSE]
+    /\ UNCHANGED <<durable, commitIndex, lastApplied, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+----
+\* Pre-vote and leadership transfer: they gate starting an election and
+\* write nothing durable.
+
+\* The log that request m describes is not behind node i's.
+UpToDate(m, i) ==
+    \/ m.lastLogTerm > LastTerm(i)
+    \/ m.lastLogTerm = LastTerm(i) /\ m.lastLogIndex >= Len(log[i])
+
+PreVoteRequest(i, t) ==
+    [type |-> "prevote", src |-> i, term |-> t,
+     lastLogIndex |-> Len(log[i]), lastLogTerm |-> LastTerm(i)]
+
+\* preElectSelf. No guard on `transfer`: request goroutines of an abandoned
+\* attempt may still send after a TimeoutNow arrives.
+SendPreVote(i) ==
+    /\ PreVote
+    /\ role[i] = Candidate
+    /\ msgs' = msgs \cup {PreVoteRequest(i, currentTerm[i] + 1)}
+    /\ UNCHANGED <<transfer, durable, role, commitIndex, lastApplied, confirmed, votes, leaders, ledLog, commits, applied>>
+
+\* requestPreVote, granted. Changes nothing at the voter. The code's
+\* "known leader" refusal is timing and is not modelled.
+GrantPreVote(j, m) ==
+    /\ m \in msgs /\ m.type = "prevote" /\ m.src # j
+    /\ m.term >= currentTerm[j]
+    /\ UpToDate(m, j)
+    /\ msgs' = msgs \cup {[type |-> "pregrant", src |-> j, dst |-> m.src, term |-> m.term]}
+    /\ UNCHANGED <<transfer, durable, role, commitIndex, lastApplied, confirmed, votes, leaders, ledLog, commits, applied>>
+
+\* Nodes that pre-granted i's next term, i included.
+PreGranted(i) ==
+    {i} \cup {j \in Server \ {i} :
+              [type |-> "pregrant", src |-> j, dst |-> i, term |-> currentTerm[i] + 1] \in msgs}
+
+\* leadershipTransfer. The request has no term and its goroutine can outlive
+\* the leadership, so only "has led" is required of the sender.
+SendTimeoutNow(i, j) ==
+    /\ \E l \in leaders : l.server = i
+    /\ j # i
+    /\ msgs' = msgs \cup {[type |-> "timeoutnow", src |-> i, dst |-> j]}
+    /\ UNCHANGED <<transfer, durable, role, commitIndex, lastApplied, confirmed, votes, leaders, ledLog, commits, applied>>
+
+\* timeoutNow: become candidate from any role and term; one election may
+\* skip pre-vote.
+TimeoutNow(j) ==
+    /\ \E m \in msgs : m.type = "timeoutnow" /\ m.dst = j
+    /\ role' = [role EXCEPT ![j] = Candidate]
+    /\ transfer' = [transfer EXCEPT ![j] = TRUE]
+    /\ UNCHANGED <<durable, commitIndex, lastApplied, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+\* runCandidate's condition for electSelf.
+MayStartElection(i) == ~PreVote \/ transfer[i] \/ IsQuorum(PreGranted(i))
+
+----
+\* Terms and votes: three separate writes.
+
+VoteRequest(i, t) ==
+    [type |-> "vote", src |-> i, term |-> t,
+     lastLogIndex |-> Len(log[i]), lastLogTerm |-> LastTerm(i)]
+
+\* electSelf: increment the term and emit the vote request.
+StartElection(i) ==
+    /\ role[i] = Candidate
+    /\ MayStartElection(i)
+    /\ currentTerm' = [currentTerm EXCEPT ![i] = @ + 1]
+    /\ msgs' = msgs \cup {VoteRequest(i, currentTerm[i] + 1)}
+    /\ transfer' = [transfer EXCEPT ![i] = FALSE]
+    /\ UNCHANGED <<voteTerm, voteFor, log, snap, base, role, commitIndex, lastApplied, confirmed, votes, leaders, ledLog, commits, applied>>
+
+\* Adopt a later term some other node has reached, and become follower.
+AdoptTerm(i, t) ==
+    /\ t > currentTerm[i]
+    /\ \E k \in Server \ {i} : currentTerm[k] >= t
+    /\ currentTerm' = [currentTerm EXCEPT ![i] = t]
+    /\ role' = [role EXCEPT ![i] = Follower]
+    /\ transfer' = [transfer EXCEPT ![i] = FALSE]
+    /\ UNCHANGED <<voteTerm, voteFor, log, snap, base, commitIndex, lastApplied, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+\* c requested i's vote in i's term with a log not behind i's. Covers the
+\* self-vote: the request exists from StartElection on.
+MayVote(i, c) ==
+    \E m \in msgs :
+        /\ m.type = "vote" /\ m.src = c /\ m.term = currentTerm[i]
+        /\ UpToDate(m, i)
+
+\* persistVote writes the candidate, then the term (patch R2); a crash in
+\* between leaves no vote. First write: the candidate.
+SetVoteFor(i, c) ==
+    /\ voteTerm[i] # currentTerm[i]
+    /\ MayVote(i, c)
+    /\ voteFor' = [voteFor EXCEPT ![i] = c]
+    /\ UNCHANGED <<transfer, currentTerm, voteTerm, log, snap, base, role, commitIndex, lastApplied, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+\* Second write: the term; the vote now exists. Both writes happen in one
+\* main-loop step, so MayVote still holds.
+SetVoteTerm(i) ==
+    /\ voteTerm[i] # currentTerm[i]
+    /\ voteFor[i] # Nil
+    /\ MayVote(i, voteFor[i])
+    /\ voteTerm' = [voteTerm EXCEPT ![i] = currentTerm[i]]
+    /\ votes' = votes \cup {[voter |-> i, term |-> currentTerm[i], cand |-> voteFor[i]]}
+    /\ UNCHANGED <<transfer, currentTerm, voteFor, log, snap, base, role, commitIndex, lastApplied, confirmed, msgs, leaders, ledLog, commits, applied>>
+
+\* A granted reply states a vote the node holds or held.
+GrantVote(i, c, t) ==
+    /\ c # i
+    /\ [voter |-> i, term |-> t, cand |-> c] \in votes
+    /\ msgs' = msgs \cup {[type |-> "grant", src |-> i, dst |-> c, term |-> t]}
+    /\ UNCHANGED <<transfer, durable, role, commitIndex, lastApplied, confirmed, votes, leaders, ledLog, commits, applied>>
+
+\* ledLog with term t set to l.
+WithLed(t, l) == [u \in DOMAIN ledLog \cup {t} |-> IF u = t THEN l ELSE ledLog[u]]
+
+Granted(i) ==
+    {j \in Server \ {i} :
+        [type |-> "grant", src |-> j, dst |-> i, term |-> currentTerm[i]] \in msgs}
+    \cup (IF [voter |-> i, term |-> currentTerm[i], cand |-> i] \in votes THEN {i} ELSE {})
+
+BecomeLeader(i) ==
+    /\ role[i] = Candidate
+    /\ IsQuorum(Granted(i))
+    /\ role' = [role EXCEPT ![i] = Leader]
+    /\ leaders' = leaders \cup {[server |-> i, term |-> currentTerm[i]]}
+    /\ ledLog' = WithLed(currentTerm[i], log[i])
+    /\ transfer' = [transfer EXCEPT ![i] = FALSE]
+    /\ UNCHANGED <<durable, commitIndex, lastApplied, confirmed, msgs, votes, commits, applied>>
+
+----
+\* Leader.
+
+\* dispatchLogs: the leader stores entries of its own term.
+LeaderAppend(i, es) ==
+    /\ role[i] = Leader
+    /\ Len(es) > 0
+    /\ \A k \in 1..Len(es) : es[k].term = currentTerm[i]
+    /\ log' = [log EXCEPT ![i] = @ \o es]
+    /\ ledLog' = WithLed(currentTerm[i], log[i] \o es)
+    /\ UNCHANGED <<transfer, currentTerm, voteTerm, voteFor, snap, base, role, commitIndex, lastApplied, confirmed, msgs, votes, leaders, commits, applied>>
+
+\* A commit a request of term t may rely on: one from a leader of term <= t.
+\* The replicator reads the commit index while leading t; without this bound
+\* a follower could commit entries that an intermediate leader later deletes.
+KnownIn(k, t) == k.term <= t
+
+\* The first c entries of l are committed as far as term t knows.
+CommittedIn(l, c, t) ==
+    \/ c = 0
+    \/ /\ c <= Len(l)
+       /\ \E k \in commits : /\ KnownIn(k, t)
+                             /\ c <= Len(k.entries)
+                             /\ SubSeq(k.entries, 1, c) = SubSeq(l, 1, c)
+
+\* replicateTo (heartbeat: p = n = c = 0): from the leader of t, n entries
+\* after index p of ledLog[t], commit index c. Independent of the sender's
+\* current state: it may be sent after the node stepped down or restarted.
+SendAppend(i, j, t, p, n, c) ==
+    /\ [server |-> i, term |-> t] \in leaders
+    /\ j # i
+    /\ p + n <= Len(ledLog[t])
+    /\ CommittedIn(ledLog[t], c, t)
+    /\ msgs' = msgs \cup {[type |-> "append", src |-> i, dst |-> j, term |-> t,
+                           prevLogIndex |-> p, prevLogTerm |-> TermAt(ledLog[t], p),
+                           entries |-> SubSeq(ledLog[t], p + 1, p + n), commit |-> c]}
+    /\ UNCHANGED <<transfer, durable, role, commitIndex, lastApplied, confirmed, votes, leaders, ledLog, commits, applied>>
+
+Acked(i, t, c) ==
+    {i} \cup {j \in Server \ {i} :
+                 \E a \in msgs : /\ a.type = "ack" /\ a.src = j /\ a.dst = i
+                                 /\ a.term = t /\ a.index >= c}
+
+Committed(s, t, c) == [server |-> s, term |-> t, entries |-> SubSeq(log[s], 1, c)]
+
+\* The leader of t commits a quorum-stored entry of term t. No guard on the
+\* current role (the code commits in a later main-loop step, possibly after
+\* stepping down) nor on commitIndex (a later leader may have moved it).
+LeaderCommit(i, t, c) ==
+    /\ [server |-> i, term |-> t] \in leaders
+    /\ c >= 1
+    /\ c <= Len(log[i])
+    /\ log[i][c].term = t
+    /\ IsQuorum(Acked(i, t, c))
+    /\ commitIndex' = [commitIndex EXCEPT ![i] = Max(@, c)]
+    /\ commits' = commits \cup {Committed(i, t, c)}
+    /\ UNCHANGED <<transfer, durable, role, lastApplied, confirmed, msgs, votes, leaders, ledLog, applied>>
+
+----
+\* Follower, handling an append request m.
+
+\* log[j] includes entries covered by the snapshot.
+PrevOk(j, m) ==
+    IF m.prevLogIndex = 0 THEN TRUE
+    ELSE /\ m.prevLogIndex <= Len(log[j])
+         /\ log[j][m.prevLogIndex].term = m.prevLogTerm
+
+\* The first k entries of m are in j's log where m puts them.
+HasFirst(j, m, k) ==
+    \A q \in 1..k :
+        /\ m.prevLogIndex + q <= Len(log[j])
+        /\ log[j][m.prevLogIndex + q].term = m.entries[q].term
+
+Confirm(j, t, k) == [confirmed EXCEPT ![j] = [term |-> t, index |-> k]]
+
+\* appendEntries: delete the suffix from the first conflict.
+DeleteSuffix(j, m, k) ==
+    /\ m \in msgs /\ m.type = "append" /\ m.dst = j
+    /\ m.term = currentTerm[j]
+    /\ PrevOk(j, m)
+    /\ k \in 1..Len(m.entries)
+    /\ HasFirst(j, m, k - 1)
+    /\ m.prevLogIndex + k <= Len(log[j])
+    /\ log[j][m.prevLogIndex + k].term # m.entries[k].term
+    \* Entries covered by the snapshot are not compared (patch R4).
+    /\ m.prevLogIndex + k > Len(snap[j])
+    /\ log' = [log EXCEPT ![j] = SubSeq(@, 1, m.prevLogIndex + k - 1)]
+    /\ confirmed' = Confirm(j, m.term, m.prevLogIndex + k - 1)
+    /\ UNCHANGED <<transfer, currentTerm, voteTerm, voteFor, snap, base, role, commitIndex, lastApplied, msgs, votes, leaders, ledLog, commits, applied>>
+
+\* appendEntries: append entries k.. of m at the end of the log.
+StoreEntries(j, m, k) ==
+    /\ m \in msgs /\ m.type = "append" /\ m.dst = j
+    /\ m.term = currentTerm[j]
+    /\ PrevOk(j, m)
+    /\ k \in 1..Len(m.entries)
+    /\ HasFirst(j, m, k - 1)
+    /\ m.prevLogIndex + k = Len(log[j]) + 1
+    /\ log' = [log EXCEPT ![j] = @ \o SubSeq(m.entries, k, Len(m.entries))]
+    /\ confirmed' = Confirm(j, m.term, m.prevLogIndex + Len(m.entries))
+    /\ UNCHANGED <<transfer, currentTerm, voteTerm, voteFor, snap, base, role, commitIndex, lastApplied, msgs, votes, leaders, ledLog, commits, applied>>
+
+
+\* Success reply: j's log holds all of m. j must be in m's term, as in the
+\* code: in a later term it may have voted for a candidate lacking these
+\* entries, or hold them only via a later leader.
+Ack(j, m) ==
+    /\ m \in msgs /\ m.type = "append" /\ m.dst = j
+    /\ currentTerm[j] = m.term
+    /\ PrevOk(j, m)
+    /\ HasFirst(j, m, Len(m.entries))
+    /\ LET last == m.prevLogIndex + Len(m.entries)
+       IN /\ msgs' = msgs \cup {[type |-> "ack", src |-> j, dst |-> m.src,
+                                 term |-> m.term, index |-> last]}
+          /\ confirmed' = Confirm(j, m.term,
+                                  IF confirmed[j].term = m.term
+                                  THEN Max(confirmed[j].index, last) ELSE last)
+    /\ UNCHANGED <<transfer, durable, role, commitIndex, lastApplied, votes, leaders, ledLog, commits, applied>>
+
+\* Commit up to the leader's commit index, within the confirmed prefix.
+FollowerCommit(j, m, c) ==
+    /\ m \in msgs /\ m.type = "append" /\ m.dst = j
+    /\ m.term = confirmed[j].term
+    /\ c > commitIndex[j]
+    /\ c <= Min(m.commit, confirmed[j].index)
+    /\ commitIndex' = [commitIndex EXCEPT ![j] = c]
+    /\ commits' = commits \cup {Committed(j, m.term, c)}
+    /\ UNCHANGED <<transfer, durable, role, lastApplied, confirmed, msgs, votes, leaders, ledLog, applied>>
+
+----
+\* Snapshots. A snapshot is represented by the entries that produced it.
+
+\* compactLogs: delete the log store's front up to b, covered by the snapshot.
+CompactLog(i, b) ==
+    /\ b > base[i]
+    /\ b <= Len(snap[i])
+    /\ base' = [base EXCEPT ![i] = b]
+    /\ UNCHANGED <<transfer, currentTerm, voteTerm, voteFor, log, snap, role, commitIndex, lastApplied, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+\* An InstallSnapshot request is modelled as an append request from index 0
+\* whose entries are all committed; there is no separate message type.
+Installable(m) ==
+    m.type = "append" /\ m.prevLogIndex = 0 /\ Len(m.entries) >= 1 /\ m.commit >= Len(m.entries)
+
+\* Node i's FSM state after k entries: snapshot plus log entries up to k.
+Machine(i, k) == snap[i] \o SubSeq(log[i], Len(snap[i]) + 1, k)
+
+\* takeSnapshot at index k <= lastApplied. The FSM state is captured first and
+\* persisted later by another goroutine, so lastApplied may be past k.
+TakeSnapshot(i, k) ==
+    /\ Snapshots
+    /\ k > Len(snap[i])
+    /\ k <= lastApplied[i]
+    /\ lastApplied[i] <= commitIndex[i]
+    /\ snap' = [snap EXCEPT ![i] = Machine(i, k)]
+    /\ UNCHANGED <<transfer, currentTerm, voteTerm, voteFor, log, base, role, commitIndex, lastApplied, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+\* installSnapshot (patch R4). The request is SendAppend with p = 0, c = n.
+\* Accepted if newer than the snapshot and the FSM, once the log holds its
+\* entries (via DeleteSuffix/StoreEntries if needed). Replied to with Ack.
+InstallSnapshot(j, m) ==
+    /\ Snapshots
+    /\ m \in msgs /\ Installable(m) /\ m.dst = j
+    /\ m.term = currentTerm[j]
+    /\ Len(m.entries) > Len(snap[j])
+    /\ Len(m.entries) > lastApplied[j]
+    /\ HasFirst(j, m, Len(m.entries))
+    /\ snap' = [snap EXCEPT ![j] = m.entries]
+    /\ lastApplied' = [lastApplied EXCEPT ![j] = Len(m.entries)]
+    /\ UNCHANGED <<transfer, currentTerm, voteTerm, voteFor, log, base, role, commitIndex, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+----
+\* processLogs: hand the next committed entry to the FSM. The second guard
+\* is implied by the first but keeps log[i][k] defined.
+Apply(i) ==
+    LET k == lastApplied[i] + 1 IN
+    /\ k <= commitIndex[i]
+    /\ k <= Len(log[i])
+    /\ lastApplied' = [lastApplied EXCEPT ![i] = k]
+    /\ applied' = applied \cup {[server |-> i, index |-> k, entry |-> log[i][k]]}
+    /\ UNCHANGED <<transfer, durable, role, commitIndex, confirmed, msgs, votes, leaders, ledLog, commits>>
+
+----
+\* Restart: durable state survives; the FSM restarts from the snapshot.
+Restart(i) ==
+    /\ role' = [role EXCEPT ![i] = Follower]
+    /\ commitIndex' = [commitIndex EXCEPT ![i] = 0]
+    /\ lastApplied' = [lastApplied EXCEPT ![i] = Len(snap[i])]
+    /\ transfer' = [transfer EXCEPT ![i] = FALSE]
+    /\ UNCHANGED <<durable, confirmed, msgs, votes, leaders, ledLog, commits, applied>>
+
+----
+ProtoNext ==
+    \/ \E i \in Server :
+          \/ BecomeCandidate(i) \/ BecomeFollower(i) \/ BecomeLeader(i)
+          \/ StartElection(i) \/ SetVoteTerm(i) \/ Restart(i) \/ Apply(i)
+          \/ \E k \in 1..lastApplied[i] : TakeSnapshot(i, k)
+          \/ \E b \in 1..Len(snap[i]) : CompactLog(i, b)
+          \/ \E t \in {currentTerm[k] : k \in Server} : AdoptTerm(i, t)
+          \/ \E c \in Server : SetVoteFor(i, c)
+          \/ \E v \in votes : v.voter = i /\ GrantVote(i, v.cand, v.term)
+          \/ SendPreVote(i) \/ TimeoutNow(i)
+          \/ \E j \in Server : SendTimeoutNow(i, j)
+          \/ \E m \in msgs : m.type = "prevote" /\ GrantPreVote(i, m)
+          \/ \E ty \in {"noop", "barrier"} : LeaderAppend(i, <<Entry(currentTerm[i], ty, Nil)>>)
+          \/ \E v \in Values : LeaderAppend(i, <<Entry(currentTerm[i], "command", v)>>)
+          \/ \E c \in 1..Len(log[i]), l \in leaders : l.server = i /\ LeaderCommit(i, l.term, c)
+          \/ \E j \in Server, l \in leaders :
+                /\ l.server = i
+                /\ \E p, n, c \in 0..Len(ledLog[l.term]) : SendAppend(i, j, l.term, p, n, c)
+    \/ \E m \in msgs :
+          /\ m.type = "append"
+          /\ \/ Ack(m.dst, m)
+             \/ \E k \in 1..Len(m.entries) : DeleteSuffix(m.dst, m, k) \/ StoreEntries(m.dst, m, k)
+             \/ \E c \in 1..m.commit : FollowerCommit(m.dst, m, c)
+             \/ InstallSnapshot(m.dst, m)
+
+Next == ProtoNext
+Spec == Init /\ [][Next]_vars
+
+----
+\* Safety properties.
+
+\* At most one server is elected in a term.
+ElectionSafety ==
+    \A a, b \in leaders : a.term = b.term => a.server = b.server
+
+\* A node's vote record never names two candidates in one term.
+OneVotePerTerm ==
+    \A a, b \in votes : a.voter = b.voter /\ a.term = b.term => a.cand = b.cand
+
+\* Equal terms at an index imply equal prefixes.
+LogMatching ==
+    \A a, b \in Server :
+        \A k \in 1..Min(Len(log[a]), Len(log[b])) :
+            log[a][k].term = log[b][k].term =>
+                SubSeq(log[a], 1, k) = SubSeq(log[b], 1, k)
+
+\* Two committed prefixes never disagree.
+CommitSafety ==
+    \A a, b \in commits : IsPrefix(a.entries, b.entries) \/ IsPrefix(b.entries, a.entries)
+
+\* No two applies at one index differ (across nodes and restarts).
+StateMachineSafety ==
+    \A a, b \in applied : a.index = b.index => a.entry = b.entry
+
+\* A leader holds every prefix committed from the log of an earlier leader.
+LeaderCompleteness ==
+    \A i \in Server, c \in commits :
+        role[i] = Leader /\ c.term < currentTerm[i] => IsPrefix(c.entries, log[i])
+
+\* A server keeps every prefix it committed.
+CommittedEntriesPreserved ==
+    \A c \in commits : IsPrefix(c.entries, log[c.server])
+
+\* Auxiliary invariants used by the proofs.
+\* A leader's log is its term's leader log.
+LeaderLogIsLed ==
+    \A i \in Server : role[i] = Leader =>
+        /\ currentTerm[i] \in DOMAIN ledLog
+        /\ log[i] = ledLog[currentTerm[i]]
+
+\* The confirmed prefix is within the log.
+ConfirmedWithinLog ==
+    \A i \in Server : confirmed[i].index <= Len(log[i])
+
+\* Every request carries a segment of its term's leader log and a commit
+\* index covering only committed entries.
+RequestsFromLed ==
+    \A m \in msgs : m.type = "append" =>
+        /\ m.term \in DOMAIN ledLog
+        /\ m.prevLogIndex + Len(m.entries) <= Len(ledLog[m.term])
+        /\ m.prevLogTerm = TermAt(ledLog[m.term], m.prevLogIndex)
+        /\ m.entries = SubSeq(ledLog[m.term], m.prevLogIndex + 1, m.prevLogIndex + Len(m.entries))
+        /\ CommittedIn(ledLog[m.term], m.commit, m.term)
+
+\* A node with a snapshot accepts a request whose previous entry is the
+\* snapshot's last.
+AcceptsAfterSnapshot ==
+    \A j \in Server : snap[j] # <<>> =>
+        PrevOk(j, [prevLogIndex |-> Len(snap[j]), prevLogTerm |-> snap[j][Len(snap[j])].term])
+
+\* A node's term never decreases.
+TermMonotonic ==
+    [][\A i \in Server : currentTerm'[i] >= currentTerm[i]]_vars
+
+\* lastApplied advances by one with that entry applied, or jumps to a snapshot.
+NoAppliesSkipped ==
+    [][\A i \in Server : lastApplied'[i] > lastApplied[i] =>
+          \/ /\ lastApplied'[i] = lastApplied[i] + 1
+             /\ \E a \in applied' : a.server = i /\ a.index = lastApplied'[i]
+          \/ lastApplied'[i] = Len(snap'[i])]_vars
+
+----
+\* Snapshots. The first four are proof invariants; SnapshotAgreesApplied
+\* follows from them. AcceptsAfterSnapshot follows from SnapshotWithinLog.
+
+\* A node's snapshot is the beginning of its log.
+SnapshotWithinLog ==
+    \A i \in Server : IsPrefix(snap[i], log[i])
+
+\* Only snapshot-covered entries are deleted from the log store's front.
+BaseWithinSnapshot ==
+    \A i \in Server : base[i] <= Len(snap[i])
+
+\* A snapshot holds committed entries only.
+SnapshotCommitted ==
+    \A i \in Server : snap[i] = <<>> \/ \E k \in commits : IsPrefix(snap[i], k.entries)
+
+\* A node's state machine is never behind its snapshot.
+SnapshotApplied ==
+    \A i \in Server : Len(snap[i]) <= lastApplied[i]
+
+\* A snapshot agrees with every apply at each index it covers.
+SnapshotAgreesApplied ==
+    \A i \in Server, a \in applied :
+        a.index <= Len(snap[i]) => snap[i][a.index] = a.entry
+
+\* A node's state machine moves back only when the node restarts.
+AppliedMonotonic ==
+    [][\A i \in Server : lastApplied'[i] < lastApplied[i] =>
+          snap'[i] = snap[i] /\ commitIndex'[i] = 0]_vars
+
+----
+\* Pre-vote and leadership transfer. No safety property depends on these;
+\* they check that the new messages mean what they should.
+
+\* A pre-vote request is for the term after one its sender has reached.
+PreVoteRequestsBounded ==
+    \A m \in msgs : m.type = "prevote" => m.term <= currentTerm[m.src] + 1
+
+\* Every pre-vote answers a request.
+PreGrantsAnswer ==
+    \A a \in msgs : a.type = "pregrant" =>
+        \E m \in msgs : m.type = "prevote" /\ m.src = a.dst /\ m.term = a.term
+
+\* Only a node that has led sends TimeoutNow.
+TimeoutNowFromLeader ==
+    \A m \in msgs : m.type = "timeoutnow" => \E l \in leaders : l.server = m.src
+
+\* A candidate by a leader's order is a candidate.
+TransferIsCandidate ==
+    \A i \in Server : transfer[i] => role[i] = Candidate
+
+\* Elections start only with a pre-vote quorum or on TimeoutNow (spelled out
+\* rather than via MayStartElection, to check that definition).
+ElectionsLicensed ==
+    [][\A i \in Server :
+          (\E m \in msgs' \ msgs : m.type = "vote" /\ m.src = i) =>
+              ~PreVote \/ transfer[i] \/ IsQuorum(PreGranted(i))]_vars
+====

@@ -1,0 +1,12 @@
+# Local override: SDK output to a file; eventually phase off unless
+# DRIVER_EVENTUALLY=on (with DRIVER_EVENTUALLY_AFTER=seconds).
+services:
+  driver:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+      DRIVER_EVENTUALLY: ${DRIVER_EVENTUALLY:-off}
+      DRIVER_EVENTUALLY_AFTER: ${DRIVER_EVENTUALLY_AFTER:-}
+      DRIVER_ADD_RATE: ${DRIVER_ADD_RATE:-5}
+      DRIVER_LINEAR_RATE: ${DRIVER_LINEAR_RATE:-2}
+      DRIVER_TRANSFER_RATE: ${DRIVER_TRANSFER_RATE:-0.1}
+      DRIVER_SNAPSHOT_RATE: ${DRIVER_SNAPSHOT_RATE:-}

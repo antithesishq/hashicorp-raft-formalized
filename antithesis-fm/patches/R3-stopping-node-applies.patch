@@ -1,0 +1,27 @@
+diff --git a/raft.go b/raft.go
+index 6e7a04b..d4cef46 100644
+--- a/raft.go
++++ b/raft.go
+@@ -1302,8 +1302,21 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
+ 	}
+ 
+ 	applyBatch := func(batch []*commitTuple) {
++		// Once the node is stopping, no batch is handed to the FSM. When
++		// both cases of the select below are ready it picks either, batch
++		// by batch, so a stopping node could drop one batch and hand over a
++		// later one, and the FSM would be given entries without the ones
++		// before them. The shutdown channel stays closed once it is closed,
++		// so after one batch has been dropped every later one is dropped
++		// here: a send on a nil channel is never ready.
++		fsmMutateCh := r.fsmMutateCh
+ 		select {
+-		case r.fsmMutateCh <- batch:
++		case <-r.shutdownCh:
++			fsmMutateCh = nil
++		default:
++		}
++		select {
++		case fsmMutateCh <- batch:
+ 		case <-r.shutdownCh:
+ 			for _, cl := range batch {
+ 				if cl.future != nil {

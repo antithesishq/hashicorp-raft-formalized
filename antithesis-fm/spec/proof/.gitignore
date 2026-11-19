@@ -1,0 +1,23 @@
+# tlapm's fingerprint cache.
+.tlacache/
+
+# Proof-check logs (chk.sh, final.sh).
+*.log
+*.log.*
+*.out
+
+# Backup checksum files.
+*.sha256.orig
+
+# TLC output.
+states/
+*_TTrace_*.tla
+*_TTrace_*.bin
+*.toolbox/
+
+# Python bytecode, editor files.
+__pycache__/
+*.pyc
+*~
+*.swp
+*.old

@@ -1,0 +1,257 @@
+diff --git a/api.go b/api.go
+index 7df7cd2..0cde242 100644
+--- a/api.go
++++ b/api.go
+@@ -603,6 +603,27 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
+ 		return nil, err
+ 	}
+ 
++	// A node stopped between storing a snapshot it was sent and discarding
++	// the log that the snapshot replaces finds both here. That log is not
++	// the node's log: it ends before the snapshot does, or its entry at the
++	// snapshot's index is of another term. (A log with no entry at that
++	// index and entries after it has been compacted, and is kept.)
++	if snapIdx, snapTerm := r.getLastSnapshot(); snapIdx > 0 && lastLog.Index > 0 {
++		discard := lastLog.Index < snapIdx
++		if !discard {
++			var entry Log
++			if err := logs.GetLog(snapIdx, &entry); err == nil && entry.Term != snapTerm {
++				discard = true
++			}
++		}
++		if discard {
++			if err := r.discardLog(); err != nil {
++				return nil, err
++			}
++			lastLog = Log{}
++		}
++	}
++
+ 	if err := r.restoreFromCommittedLogs(); err != nil {
+ 		return nil, err
+ 	}
+diff --git a/raft.go b/raft.go
+index d4cef46..95c4e31 100644
+--- a/raft.go
++++ b/raft.go
+@@ -1506,13 +1506,31 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+ 	// Verify the last log entry
+ 	if a.PrevLogEntry > 0 {
+ 		lastIdx, lastTerm := r.getLastEntry()
++		snapIdx, snapTerm := r.getLastSnapshot()
+ 
++		// A snapshot counts as log. The entry at the snapshot's index has
++		// the snapshot's term, and the entries before it are committed, so
++		// they are the leader's: neither is looked up in the log store,
++		// which may no longer have them.
+ 		var prevLogTerm uint64
+ 		if a.PrevLogEntry == lastIdx {
+ 			prevLogTerm = lastTerm
++		} else if a.PrevLogEntry == snapIdx {
++			prevLogTerm = snapTerm
++		} else if a.PrevLogEntry < snapIdx {
++			prevLogTerm = a.PrevLogTerm
+ 		} else {
+ 			var prevLog Log
+-			if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
++			if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err == nil {
++				prevLogTerm = prevLog.Term
++			} else if snapIdx, snapTerm = r.getLastSnapshot(); a.PrevLogEntry == snapIdx {
++				// The node has finished a snapshot of its own since the
++				// snapshot's index was read above, and has deleted the
++				// log that it covers.
++				prevLogTerm = snapTerm
++			} else if a.PrevLogEntry < snapIdx {
++				prevLogTerm = a.PrevLogTerm
++			} else {
+ 				r.logger.Warn("failed to get previous log",
+ 					"previous-index", a.PrevLogEntry,
+ 					"last-index", lastIdx,
+@@ -1520,7 +1538,6 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+ 				resp.NoRetryBackoff = true
+ 				return
+ 			}
+-			prevLogTerm = prevLog.Term
+ 		}
+ 
+ 		if a.PrevLogTerm != prevLogTerm {
+@@ -1538,14 +1555,23 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+ 
+ 		// Delete any conflicting entries, skip any duplicates
+ 		lastLogIdx, _ := r.getLastLog()
++		snapIdx, _ := r.getLastSnapshot()
+ 		var newEntries []*Log
+ 		for i, entry := range a.Entries {
++			// The snapshot has this entry. The log store may not.
++			if entry.Index <= snapIdx {
++				continue
++			}
+ 			if entry.Index > lastLogIdx {
+ 				newEntries = a.Entries[i:]
+ 				break
+ 			}
+ 			var storeEntry Log
+ 			if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
++				// As above: a snapshot finished meanwhile has this entry.
++				if snapIdx, _ = r.getLastSnapshot(); entry.Index <= snapIdx {
++					continue
++				}
+ 				r.logger.Warn("failed to get log entry",
+ 					"index", entry.Index,
+ 					"error", err)
+@@ -1904,6 +1930,20 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
+ 		}
+ 		reqConfigurationIndex = req.LastLogIndex
+ 	}
++	// A snapshot that is not newer than the node's own, or than what its
++	// state machine holds, is not installed: it would move the state machine
++	// back. The node has everything the snapshot has, which is what the
++	// leader needs to know.
++	if snapIdx, _ := r.getLastSnapshot(); req.LastLogIndex <= snapIdx || req.LastLogIndex <= r.getLastApplied() {
++		r.logger.Info("ignoring installSnapshot request that is not newer than the state machine",
++			"request-index", req.LastLogIndex,
++			"snapshot-index", snapIdx,
++			"last-applied", r.getLastApplied())
++		resp.Success = true
++		r.setLastContact()
++		return
++	}
++
+ 	version := getSnapshotVersion(r.protocolVersion)
+ 	sink, err := r.snapshots.Create(version, req.LastLogIndex, req.LastLogTerm,
+ 		reqConfiguration, reqConfigurationIndex, r.trans)
+@@ -1973,10 +2013,14 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
+ 	r.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)
+ 	r.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)
+ 
+-	// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the
+-	// logs. In both cases, log any errors and continue.
+-	if mlogs, ok := r.logs.(MonotonicLogStore); ok && mlogs.IsMonotonic() {
+-		if err := r.removeOldLogs(); err != nil {
++	// The log is kept only if it continues the snapshot: it has an entry at
++	// the snapshot's index, of the snapshot's term. Otherwise all of it is
++	// discarded (it is shorter than the snapshot, or it differs from it),
++	// and the node's last entry is the snapshot's. A MonotonicLogStore
++	// cannot be compacted from the front and is always emptied.
++	mlogs, ok := r.logs.(MonotonicLogStore)
++	if !r.logContinuesSnapshot(req.LastLogIndex, req.LastLogTerm) || (ok && mlogs.IsMonotonic()) {
++		if err := r.discardLog(); err != nil {
+ 			r.logger.Error("failed to reset logs", "error", err)
+ 		}
+ 	} else if err := r.compactLogs(req.LastLogIndex); err != nil {
+@@ -1988,6 +2032,41 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
+ 	r.setLastContact()
+ }
+ 
++// logContinuesSnapshot reports whether the log store has an entry at the
++// index of a snapshot, of the snapshot's term.
++func (r *Raft) logContinuesSnapshot(snapIdx, snapTerm uint64) bool {
++	lastLogIdx, err := r.logs.LastIndex()
++	if err != nil || lastLogIdx < snapIdx {
++		return false
++	}
++	var entry Log
++	if err := r.logs.GetLog(snapIdx, &entry); err != nil {
++		return false
++	}
++	return entry.Term == snapTerm
++}
++
++// discardLog empties the log store. The node's last entry is then the last
++// entry of its snapshot.
++func (r *Raft) discardLog() error {
++	firstIdx, err := r.logs.FirstIndex()
++	if err != nil {
++		return fmt.Errorf("failed to get first log index: %w", err)
++	}
++	lastIdx, err := r.logs.LastIndex()
++	if err != nil {
++		return fmt.Errorf("failed to get last log index: %w", err)
++	}
++	if lastIdx > 0 {
++		r.logger.Info("discarding the log", "from", firstIdx, "to", lastIdx)
++		if err := r.logs.DeleteRange(firstIdx, lastIdx); err != nil {
++			return fmt.Errorf("failed to discard the log: %w", err)
++		}
++	}
++	r.setLastLog(0, 0)
++	return nil
++}
++
+ // setLastContact is used to set the last contact time to now
+ func (r *Raft) setLastContact() {
+ 	r.lastContactLock.Lock()
+diff --git a/raft_test.go b/raft_test.go
+index 7c4cc1e..daad280 100644
+--- a/raft_test.go
++++ b/raft_test.go
+@@ -1736,7 +1736,9 @@ func snapshotAndRestore(t *testing.T, offset uint64, monotonicLogStore bool, res
+ 		require.NoError(t, err)
+ 		lastLogIndex, err := raftNode.logs.LastIndex()
+ 		require.NoError(t, err)
+-		if monotonicLogStore {
++		// A follower's log ended before the snapshot it was sent, so it
++		// discarded that log, whatever its store.
++		if monotonicLogStore || raftNode != leader {
+ 			require.Equal(t, expected, firstLogIndex)
+ 		} else {
+ 			require.Equal(t, uint64(1), firstLogIndex)
+diff --git a/replication.go b/replication.go
+index 0cb44a6..8338621 100644
+--- a/replication.go
++++ b/replication.go
+@@ -348,6 +348,14 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
+ 	peer := s.peer
+ 	s.peerLock.RUnlock()
+ 
++	// As for an append request: a replicator can outlive its leadership,
++	// and the snapshot it has just opened may then hold entries committed
++	// under a later leader. While the node leads this replicator's term,
++	// its newest snapshot is the beginning of that leader's log.
++	if r.getState() != Leader || r.getCurrentTerm() != s.currentTerm {
++		return true, nil
++	}
++
+ 	r.logger.Info("installing snapshot on", "peer", peer.ID, "id", snapID, "size", req.Size)
+ 	// Make the call
+ 	start := time.Now()
+diff --git a/snapshot.go b/snapshot.go
+index 8b530f8..2bdbe83 100644
+--- a/snapshot.go
++++ b/snapshot.go
+@@ -199,8 +199,9 @@ func (r *Raft) takeSnapshot() (string, error) {
+ 		return "", fmt.Errorf("failed to close snapshot: %v", err)
+ 	}
+ 
+-	// Update the last stable snapshot info.
+-	r.setLastSnapshot(snapReq.index, snapReq.term)
++	// Update the last stable snapshot info, unless a newer snapshot has
++	// been installed since the state machine was asked for this one.
++	r.advanceLastSnapshot(snapReq.index, snapReq.term)
+ 
+ 	// Compact the logs.
+ 	if err := r.compactLogs(snapReq.index); err != nil {
+diff --git a/state.go b/state.go
+index 5abac1e..c5b19bd 100644
+--- a/state.go
++++ b/state.go
+@@ -124,6 +124,19 @@ func (r *raftState) setLastSnapshot(index, term uint64) {
+ 	r.lastLock.Unlock()
+ }
+ 
++// advanceLastSnapshot records a snapshot as the node's newest unless the
++// node already has a newer one. A snapshot the node takes is written by a
++// goroutine of its own, and can be finished after the main loop has
++// installed a newer one that the node was sent.
++func (r *raftState) advanceLastSnapshot(index, term uint64) {
++	r.lastLock.Lock()
++	if index > r.lastSnapshotIndex {
++		r.lastSnapshotIndex = index
++		r.lastSnapshotTerm = term
++	}
++	r.lastLock.Unlock()
++}
++
+ func (r *raftState) getCommitIndex() uint64 {
+ 	return atomic.LoadUint64(&r.commitIndex)
+ }

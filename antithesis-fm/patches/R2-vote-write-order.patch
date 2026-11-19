@@ -1,0 +1,23 @@
+diff --git a/raft.go b/raft.go
+index 6e7a04b..d4cef46 100644
+--- a/raft.go
++++ b/raft.go
+@@ -2151,10 +2164,16 @@ func (r *Raft) preElectSelf() <-chan *preVoteResult {
+ 
+ // persistVote is used to persist our vote for safety.
+ func (r *Raft) persistVote(term uint64, candidate []byte) error {
+-	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
++	// The candidate is written before the term. If only the first write
++	// happens, the record pairs an older term with the new candidate, and no
++	// request can match it: a request for an older term is rejected before
++	// the record is read. Written the other way round, the record would pair
++	// the new term with an older candidate, whose request for the new term
++	// would then be granted without comparing logs.
++	if err := r.stable.Set(keyLastVoteCand, candidate); err != nil {
+ 		return err
+ 	}
+-	if err := r.stable.Set(keyLastVoteCand, candidate); err != nil {
++	if err := r.stable.SetUint64(keyLastVoteTerm, term); err != nil {
+ 		return err
+ 	}
+ 	return nil
